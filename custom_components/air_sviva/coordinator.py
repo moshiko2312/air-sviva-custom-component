@@ -2,20 +2,39 @@
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 from air_sviva_api.models.exceptions import SvivaAirError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CONF_REGION_ID, CONF_STATION_ID, DOMAIN, LOGGER, SCAN_INTERVAL
+from .const import (
+    CONF_REGION_ID,
+    CONF_STATION_ID,
+    DEFAULT_HOURS_BACK,
+    DOMAIN,
+    FALLBACK_HOURS_BACK,
+    LOGGER,
+    SCAN_INTERVAL,
+)
 
 if TYPE_CHECKING:
     from air_sviva_api.client import SvivaAirClient
-    from air_sviva_api.models.reading import RegionStationData
+    from air_sviva_api.models.reading import RegionStationData, StationIndexData
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
     from .data import AirSvivaData
+
+
+INVALID_API_VALUES = {-9999.0, 9999.0}
+
+
+def _is_invalid_api_value(value: Any) -> bool:
+    """Return True when the API value is a sentinel for missing data."""
+    if not isinstance(value, (int, float)) or not isfinite(value):
+        return False
+    return float(value) in INVALID_API_VALUES
 
 
 def _parse_station_channels(station_data: RegionStationData) -> dict[str, Any]:
@@ -26,7 +45,12 @@ def _parse_station_channels(station_data: RegionStationData) -> dict[str, Any]:
         return channels
 
     for channel in station_data.region_data.channels:
-        if not channel.active or channel.value is None:
+        if (
+            not channel.active
+            or channel.value is None
+            or not channel.valid
+            or _is_invalid_api_value(channel.value)
+        ):
             continue
 
         # Use alias (Hebrew name) as description if available
@@ -48,6 +72,30 @@ def _parse_station_channels(station_data: RegionStationData) -> dict[str, Any]:
     return channels
 
 
+def _parse_station_index(station_index: StationIndexData | None) -> dict[str, Any] | None:
+    """Parse the official latest station index into a sensor payload."""
+    if station_index is None or station_index.index is None:
+        return None
+
+    if _is_invalid_api_value(station_index.index) or _is_invalid_api_value(station_index.value):
+        return None
+
+    return {
+        "name": "Index",
+        "alias": "Air Quality Index",
+        "value": station_index.index,
+        "status": None,
+        "valid": True,
+        "units": "AQI",
+        "pollutant_id": station_index.pollutant_id,
+        "datetime": station_index.datetime,
+        "description": station_index.description,
+        "color": station_index.color,
+        "source_value": station_index.value,
+        "dominant_pollutant": station_index.pollutant,
+    }
+
+
 class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to fetch station data from Air Sviva API."""
 
@@ -66,16 +114,40 @@ class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.config_entry = config_entry
 
+    async def _get_station_latest_data(
+        self,
+        client: SvivaAirClient,
+    ) -> tuple[RegionStationData | None, int]:
+        """Fetch the newest usable station payload, with a wider fallback window."""
+        hours_back_options = [DEFAULT_HOURS_BACK, FALLBACK_HOURS_BACK]
+
+        for hours_back in hours_back_options:
+            response = await client.get_regions_latest_data(
+                region_ids=[self._region_id],
+                hours_back=hours_back,
+            )
+            station_data = next(
+                (station for station in response if station.station_id == self._station_id),
+                None,
+            )
+            if station_data is None:
+                continue
+
+            if _parse_station_channels(station_data):
+                return station_data, hours_back
+
+            if hours_back == hours_back_options[-1]:
+                return station_data, hours_back
+
+        return None, hours_back_options[-1]
+
     async def _async_update_data(self) -> dict[str, Any]:
         entry_data: AirSvivaData = self.hass.data[DOMAIN][self.config_entry.entry_id]
         client: SvivaAirClient = entry_data.client
 
         try:
-            # Fetch latest data for the configured station's region
-            response: list[RegionStationData] = await client.get_regions_latest_data(
-                region_ids=[self._region_id],
-                hours_back=4,
-            )
+            station_data, hours_back_used = await self._get_station_latest_data(client)
+            latest_index = await client.get_stations_latest_index(hours_back=24)
         except SvivaAirError as exc:
             LOGGER.error(
                 "Failed to fetch station data for %s: %s",
@@ -92,25 +164,48 @@ class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             msg = f"Unexpected error: {exc}"
             raise UpdateFailed(msg) from exc
 
-        data: dict[str, Any] = {"station_id": self._station_id, "channels": {}}
+        data: dict[str, Any] = {
+            "station_id": self._station_id,
+            "channels": {},
+            "official_index": None,
+            "hours_back_used": hours_back_used,
+        }
 
-        # Find the selected station in the response
-        station_data = next(
-            (s for s in response if s.station_id == self._station_id), None
+        station_index = next(
+            (
+                station
+                for station in (latest_index.data or [])
+                if station.station_id == self._station_id
+            ),
+            None,
         )
+        official_index = _parse_station_index(station_index)
+        if official_index is not None:
+            data["official_index"] = official_index
+            data["channels"]["Index"] = official_index
 
         if not station_data:
-            LOGGER.debug("Station %s not found in response", self._station_id)
+            LOGGER.debug("Station %s not found in latest channel response", self._station_id)
+            if official_index is not None:
+                data["datetime"] = official_index.get("datetime")
             return data
 
         data["station_id"] = station_data.station_id
 
         # Parse all channels for this station
-        data["channels"] = _parse_station_channels(station_data)
+        parsed_channels = _parse_station_channels(station_data)
+        data["channels"].update(parsed_channels)
 
         # Get the datetime from the first channel
         if station_data.region_data and station_data.region_data.channels:
             first_channel = station_data.region_data.channels[0]
             data["datetime"] = first_channel.datetime
+
+        if hours_back_used > DEFAULT_HOURS_BACK:
+            LOGGER.debug(
+                "Station %s required fallback raw data window of %s hours",
+                self._station_id,
+                hours_back_used,
+            )
 
         return data
