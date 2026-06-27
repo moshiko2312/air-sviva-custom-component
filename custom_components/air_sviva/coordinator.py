@@ -8,7 +8,15 @@ from typing import TYPE_CHECKING, Any
 from air_sviva_api.models.exceptions import SvivaAirError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CONF_REGION_ID, CONF_STATION_ID, DOMAIN, LOGGER, SCAN_INTERVAL
+from .const import (
+    CONF_REGION_ID,
+    CONF_STATION_ID,
+    DEFAULT_HOURS_BACK,
+    DOMAIN,
+    FALLBACK_HOURS_BACK,
+    LOGGER,
+    SCAN_INTERVAL,
+)
 
 if TYPE_CHECKING:
     from air_sviva_api.client import SvivaAirClient
@@ -106,16 +114,39 @@ class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.config_entry = config_entry
 
+    async def _get_station_latest_data(
+        self,
+        client: SvivaAirClient,
+    ) -> tuple[RegionStationData | None, int]:
+        """Fetch the newest usable station payload, with a wider fallback window."""
+        hours_back_options = [DEFAULT_HOURS_BACK, FALLBACK_HOURS_BACK]
+
+        for hours_back in hours_back_options:
+            response = await client.get_regions_latest_data(
+                region_ids=[self._region_id],
+                hours_back=hours_back,
+            )
+            station_data = next(
+                (station for station in response if station.station_id == self._station_id),
+                None,
+            )
+            if station_data is None:
+                continue
+
+            if _parse_station_channels(station_data):
+                return station_data, hours_back
+
+            if hours_back == hours_back_options[-1]:
+                return station_data, hours_back
+
+        return None, hours_back_options[-1]
+
     async def _async_update_data(self) -> dict[str, Any]:
         entry_data: AirSvivaData = self.hass.data[DOMAIN][self.config_entry.entry_id]
         client: SvivaAirClient = entry_data.client
 
         try:
-            # Fetch latest data for the configured station's region
-            response: list[RegionStationData] = await client.get_regions_latest_data(
-                region_ids=[self._region_id],
-                hours_back=4,
-            )
+            station_data, hours_back_used = await self._get_station_latest_data(client)
             latest_index = await client.get_stations_latest_index(hours_back=24)
         except SvivaAirError as exc:
             LOGGER.error(
@@ -137,6 +168,7 @@ class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "station_id": self._station_id,
             "channels": {},
             "official_index": None,
+            "hours_back_used": hours_back_used,
         }
 
         station_index = next(
@@ -152,11 +184,6 @@ class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data["official_index"] = official_index
             data["channels"]["Index"] = official_index
 
-        # Find the selected station in the response
-        station_data = next(
-            (s for s in response if s.station_id == self._station_id), None
-        )
-
         if not station_data:
             LOGGER.debug("Station %s not found in latest channel response", self._station_id)
             if official_index is not None:
@@ -166,11 +193,19 @@ class AirSvivaUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data["station_id"] = station_data.station_id
 
         # Parse all channels for this station
-        data["channels"].update(_parse_station_channels(station_data))
+        parsed_channels = _parse_station_channels(station_data)
+        data["channels"].update(parsed_channels)
 
         # Get the datetime from the first channel
         if station_data.region_data and station_data.region_data.channels:
             first_channel = station_data.region_data.channels[0]
             data["datetime"] = first_channel.datetime
+
+        if hours_back_used > DEFAULT_HOURS_BACK:
+            LOGGER.debug(
+                "Station %s required fallback raw data window of %s hours",
+                self._station_id,
+                hours_back_used,
+            )
 
         return data

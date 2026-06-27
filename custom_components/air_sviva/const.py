@@ -16,5 +16,6 @@ CONF_STATION_NAME = "station_name"
 
 SCAN_INTERVAL = timedelta(minutes=10)
 DEFAULT_HOURS_BACK = 4
+FALLBACK_HOURS_BACK = 24
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
